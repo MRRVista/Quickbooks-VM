@@ -1,0 +1,10 @@
+<!doctype html><html><head><meta charset="utf-8"><title>vistamark-quickbooks</title>
+<style>body{font-family:system-ui,sans-serif;max-width:640px;margin:60px auto;padding:0 20px;color:#1B2A4A}code{background:#f4f4f4;padding:2px 6px;border-radius:4px}</style></head>
+<body><h1>vistamark-quickbooks</h1>
+<p>Read-only proxy serving live YTD W-2 payroll data from QuickBooks to VistaBalancer.</p>
+<ul>
+<li><code>GET /api/w2-ytd</code> — YTD gross by individual (requires <code>ACCESS_TOKEN</code> header)</li>
+<li><code>GET /api/health</code> — config + token-mint check</li>
+</ul>
+<p>Secrets live in Vercel env vars only. Pattern mirrors vistamark-wealthbox.</p>
+</body></html>

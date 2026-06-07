@@ -1,0 +1,7 @@
+{
+  "name": "vistamark-quickbooks",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Read-only QuickBooks proxy: serves live YTD W-2 gross to VistaBalancer. Mirrors the vistamark-wealthbox proxy pattern.",
+  "engines": { "node": ">=18" }
+}
