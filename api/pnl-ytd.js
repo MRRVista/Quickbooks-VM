@@ -6,14 +6,20 @@
 //
 //  Pulls the standard ProfitAndLoss report summarized BY MONTH, then reads the
 //  authoritative section Summary rows (QBO's own computed totals) for Income,
-//  Expenses, and Net Income — and lists each immediate sub-section as a line
-//  item. Reading the Summary rows (rather than summing leaf rows) guarantees
-//  the totals match QuickBooks exactly, including amounts posted directly to a
-//  parent account header. Shape consumed by the app's _pnlNormalize():
-//      { months:['Jan',...], income:[{name,monthly[],ytd}],
+//  Expenses, and Net Income. Income is EXPANDED to leaf accounts (each revenue
+//  group emits a bold subtotal row followed by its indented child accounts);
+//  expenses stay grouped at the top sub-section level. Reading Summary rows
+//  (rather than summing leaves) guarantees totals match QuickBooks exactly,
+//  including amounts posted directly to a parent account header. Shape consumed
+//  by the app's _pnlNormalize():
+//      { months:['Jan',...],
+//        income:[{name,monthly[],ytd,depth,isGroup}],
 //        expenses:[{name,monthly[],ytd}],
 //        totals:{ incomeMonthly[], expenseMonthly[], incomeYtd, expenseYtd,
 //                 netMonthly[], netYtd } }
+//  depth/isGroup are optional render hints; the app indents children by depth
+//  and bolds isGroup subtotal rows. Totals always come from QBO Summary rows,
+//  so the group + leaf rows are display-only and never double-counted.
 //
 //  Auth: header ACCESS_TOKEN:<secret>  OR  ?key=<secret>  vs VB_ACCESS_TOKEN
 //  Diagnostics (valid key/header): ?debug=1 returns the raw QBO P&L body.
@@ -80,28 +86,41 @@ function rowToMonthly(colData, monthCols) {
   });
 }
 
-// Line items for a top-level section: each immediate child Section contributes
-// its (QBO-computed) Summary row; each immediate child Data row contributes
-// itself. This reproduces the section total exactly with no double counting and
-// captures parent-header postings (which QBO already folds into the summary).
-function sectionLines(section, monthCols) {
-  const out = [];
+// Line items for a top-level section.
+//   expand=false → one summary line per immediate child sub-section/account
+//                  (used for Expenses — keeps the table compact).
+//   expand=true  → for each child sub-section, emit a bold group subtotal row
+//                  (from its QBO Summary) then recurse into its children,
+//                  indented via depth. Direct child Data rows emit as-is.
+//                  (used for Income — drills revenue down to the named payors.)
+// Totals are always taken from the section Summary elsewhere, so these rows are
+// display-only and the group+leaf mix never affects the headline numbers.
+function sectionLines(section, monthCols, expand, depth, out) {
+  out = out || [];
+  depth = depth || 0;
   const kids = (section.Rows && section.Rows.Row) || [];
   for (const row of (Array.isArray(kids) ? kids : [kids])) {
-    if (row.Summary && row.Summary.ColData) {
-      const sum = row.Summary.ColData;
-      const name = (sum[0] && sum[0].value || '').replace(/^Total\s+/i, '').trim();
-      const monthly = rowToMonthly(sum, monthCols);
+    const isGroupNode = row.Rows && row.Rows.Row;
+    if (isGroupNode) {
+      const sum = row.Summary && row.Summary.ColData;
+      const name = (sum && sum[0] && sum[0].value || '').replace(/^Total\s+/i, '').trim();
+      const monthly = sum ? rowToMonthly(sum, monthCols) : [];
       const ytd = monthly.reduce((s, v) => s + v, 0);
-      if (!name) continue;
-      out.push({ name, monthly: monthly.map(r2), ytd: r2(ytd) });
+      if (!expand) {
+        if (name) out.push({ name, monthly: monthly.map(r2), ytd: r2(ytd) });
+      } else {
+        if (name) out.push({ name, monthly: monthly.map(r2), ytd: r2(ytd), depth, isGroup: true });
+        sectionLines(row, monthCols, expand, depth + 1, out);
+      }
     } else if (row.ColData) {
       const name = (row.ColData[0] && row.ColData[0].value || '').trim();
       if (!name) continue;
       const monthly = rowToMonthly(row.ColData, monthCols);
       const ytd = monthly.reduce((s, v) => s + v, 0);
       if (ytd === 0 && monthly.every(v => v === 0)) continue;
-      out.push({ name, monthly: monthly.map(r2), ytd: r2(ytd) });
+      const item = { name, monthly: monthly.map(r2), ytd: r2(ytd) };
+      if (expand) item.depth = depth;
+      out.push(item);
     }
   }
   return out;
@@ -120,8 +139,10 @@ function flattenPnl(report) {
     else if (g === 'netincome') netSummary = sec.Summary && sec.Summary.ColData;
   }
 
-  const income   = incomeSec  ? sectionLines(incomeSec, monthCols)  : [];
-  const expenses = expenseSec ? sectionLines(expenseSec, monthCols) : [];
+  // Income drilled to leaf accounts (group subtotal + indented children).
+  const income   = incomeSec  ? sectionLines(incomeSec, monthCols, true)   : [];
+  // Expenses kept grouped at the top sub-section level.
+  const expenses = expenseSec ? sectionLines(expenseSec, monthCols, false) : [];
 
   const readSummary = (sec) => {
     const sum = sec && sec.Summary && sec.Summary.ColData;
@@ -132,9 +153,11 @@ function flattenPnl(report) {
   const incT = readSummary(incomeSec);
   const expT = readSummary(expenseSec);
 
-  const incomeMonthly  = incT ? incT.monthly : months.map((_, i) => r2(income.reduce((s, r) => s + r.monthly[i], 0)));
+  // Totals come from QBO Summary rows. For income (now a mix of group + leaf
+  // rows) we must NOT sum the display rows — use the section Summary directly.
+  const incomeMonthly  = incT ? incT.monthly : months.map((_, i) => r2(income.filter(r => !r.isGroup).reduce((s, r) => s + r.monthly[i], 0)));
   const expenseMonthly = expT ? expT.monthly : months.map((_, i) => r2(expenses.reduce((s, r) => s + r.monthly[i], 0)));
-  const incomeYtd  = incT ? incT.ytd : r2(income.reduce((s, r) => s + r.ytd, 0));
+  const incomeYtd  = incT ? incT.ytd : r2(income.filter(r => !r.isGroup).reduce((s, r) => s + r.ytd, 0));
   const expenseYtd = expT ? expT.ytd : r2(expenses.reduce((s, r) => s + r.ytd, 0));
 
   let netMonthly, netYtd;
