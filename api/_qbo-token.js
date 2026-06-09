@@ -2,62 +2,86 @@
 //  _qbo-token.js — Intuit OAuth2 access-token minting (production)
 //  Shared helper for all QuickBooks endpoints in this proxy.
 //
-//  SELF-HEALING REFRESH TOKEN (v2 — June 2026)
+//  SELF-HEALING REFRESH TOKEN (v3 — June 2026)
 //  ───────────────────────────────────────────
 //  Intuit rotates the refresh token on (roughly) every use and retires the old
 //  one after a short grace window; it also hard-expires after ~100 days of
-//  inactivity. The previous version of this file was STATELESS: it read the
-//  refresh token from an env var and threw away the rotated token Intuit hands
-//  back on every refresh — so it always re-presented the ORIGINAL token, which
-//  inevitably went stale and 400'd ("Incorrect or invalid refresh token").
-//  That is why the connection kept dying and needed constant manual re-mints.
+//  inactivity. The original version was STATELESS: it read the refresh token
+//  from an env var and threw away the rotated token Intuit hands back on every
+//  refresh — so it always re-presented the ORIGINAL token, which inevitably
+//  went stale and 400'd ("Incorrect or invalid refresh token"). That is why the
+//  connection kept dying and needed constant manual re-mints.
 //
-//  This version PERSISTS the rotated refresh token to Vercel KV (Upstash Redis)
-//  via its REST API using plain fetch (no npm dependency, no build change). The
-//  flow is now:
-//
+//  This version PERSISTS the rotated refresh token to a Redis/KV store (Upstash)
+//  via its REST API using plain fetch (no npm dependency, no build change):
 //    1. Read the current refresh token from KV.
-//       └─ If KV is empty/unconfigured, fall back to the QBO_REFRESH_TOKEN env
-//          var (first-run seed). So the proxy works the moment you re-mint,
-//          even before a KV store is connected.
+//       └─ If KV is empty/unconfigured, fall back to QBO_REFRESH_TOKEN env var.
 //    2. Exchange it with Intuit for an access token.
 //    3. Intuit returns a (usually new) refresh token → WRITE IT BACK to KV.
 //       └─ Next call reads the fresh one. The chain self-heals forever.
 //
-//  Once a KV store is connected + seeded once, you never re-mint again.
+//  v3 change: the Upstash/Vercel integration names its REST env vars differently
+//  depending on how the store was connected (KV_REST_API_*, UPSTASH_REDIS_REST_*,
+//  or a custom-prefixed STORAGE_*). v2 only looked for KV_REST_API_* and so
+//  reported kvEnabled:false even when a store was connected under a different
+//  name. v3 auto-detects ALL the common names so it Just Works regardless of how
+//  the store was wired.
 //
-//  Required Vercel env vars (all from ONE production Intuit app — the Client ID,
+//  Required Vercel env vars (all from ONE production Intuit app — Client ID,
 //  Secret, and Refresh Token MUST come from the same app or Intuit returns 400):
-//    QBO_CLIENT_ID       — production Client ID
-//    QBO_CLIENT_SECRET   — production Client Secret
-//    QBO_REFRESH_TOKEN   — long-lived OAuth refresh token (first-run seed only;
-//                          after KV is seeded, KV is authoritative)
-//    QBO_REALM_ID        — 9341454566029927  (Vistamark Investments LLC)
+//    QBO_CLIENT_ID, QBO_CLIENT_SECRET, QBO_REFRESH_TOKEN, QBO_REALM_ID
 //
-//  Auto-injected when you connect a Vercel KV / Upstash store to the project
-//  (Storage → Upstash → Connect). If absent, the proxy silently runs in the
-//  old env-var-only mode (still works, just not self-healing):
-//    KV_REST_API_URL     — e.g. https://xxx.upstash.io
-//    KV_REST_API_TOKEN   — bearer token for the KV REST API
+//  KV REST vars (any one of these name-pairs works; auto-injected by the
+//  Upstash integration when you connect a store):
+//    KV_REST_API_URL          + KV_REST_API_TOKEN
+//    UPSTASH_REDIS_REST_URL   + UPSTASH_REDIS_REST_TOKEN
+//    <PREFIX>_REST_API_URL    + <PREFIX>_REST_API_TOKEN   (custom prefix)
 //
 //  Optional:
-//    QBO_KV_KEY          — KV key name to store the token under
-//                          (default: "qbo:refresh_token")
+//    QBO_KV_KEY   — KV key name for the token (default: "qbo:refresh_token")
 // ─────────────────────────────────────────────────────────────────────────────
 
 const TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
 
-const KV_URL   = process.env.KV_REST_API_URL   || '';
-const KV_TOKEN = process.env.KV_REST_API_TOKEN || '';
-const KV_KEY   = process.env.QBO_KV_KEY        || 'qbo:refresh_token';
+// ── Auto-detect the KV REST endpoint + token across all the names the Upstash /
+//    Vercel integration may use. Returns { url, token, urlVar, tokenVar }. ─────
+function detectKv() {
+  const env = process.env;
+  // 1) Exact well-known pairs, in priority order.
+  const KNOWN_PAIRS = [
+    ['KV_REST_API_URL', 'KV_REST_API_TOKEN'],
+    ['UPSTASH_REDIS_REST_URL', 'UPSTASH_REDIS_REST_TOKEN'],
+    ['REDIS_REST_API_URL', 'REDIS_REST_API_TOKEN'],
+  ];
+  for (const [u, t] of KNOWN_PAIRS) {
+    if (env[u] && env[t]) return { url: env[u], token: env[t], urlVar: u, tokenVar: t };
+  }
+  // 2) Generic discovery: any *_REST_API_URL that has a matching *_REST_API_TOKEN
+  //    (covers a custom Storage prefix like MYKV_REST_API_URL/_TOKEN).
+  for (const k of Object.keys(env)) {
+    if (/_REST_API_URL$/.test(k) && env[k]) {
+      const tVar = k.replace(/_REST_API_URL$/, '_REST_API_TOKEN');
+      if (env[tVar]) return { url: env[k], token: env[tVar], urlVar: k, tokenVar: tVar };
+    }
+    // Upstash-style prefix: <PREFIX>_REDIS_REST_URL / _TOKEN
+    if (/_REDIS_REST_URL$/.test(k) && env[k]) {
+      const tVar = k.replace(/_REDIS_REST_URL$/, '_REDIS_REST_TOKEN');
+      if (env[tVar]) return { url: env[k], token: env[tVar], urlVar: k, tokenVar: tVar };
+    }
+  }
+  return { url: '', token: '', urlVar: null, tokenVar: null };
+}
+
+const _KV = detectKv();
+const KV_URL   = _KV.url;
+const KV_TOKEN = _KV.token;
+const KV_KEY   = process.env.QBO_KV_KEY || 'qbo:refresh_token';
 const KV_ENABLED = !!(KV_URL && KV_TOKEN);
 
 // Module-memory cache (persists across warm invocations on the same instance).
 let _cachedToken = null;       // { accessToken, expiresAt, rotatedRefreshToken }
 
 // ── KV helpers (Upstash REST API; no SDK) ────────────────────────────────────
-// Upstash REST supports GET /get/<key> and POST /set/<key> with the value in
-// the body. Responses look like { "result": "<value>" } (null if missing).
 async function kvGet(key) {
   if (!KV_ENABLED) return null;
   try {
@@ -67,7 +91,7 @@ async function kvGet(key) {
     if (!r.ok) return null;
     const j = await r.json();
     const v = j && typeof j.result !== 'undefined' ? j.result : null;
-    return (v === null || v === '' ) ? null : v;
+    return (v === null || v === '') ? null : v;
   } catch (_) {
     return null;   // KV must never break the auth path — degrade to env var.
   }
@@ -78,10 +102,7 @@ async function kvSet(key, value) {
   try {
     const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${KV_TOKEN}`,
-        'Content-Type': 'text/plain',
-      },
+      headers: { Authorization: `Bearer ${KV_TOKEN}`, 'Content-Type': 'text/plain' },
       body: String(value),
     });
     return r.ok;
@@ -100,7 +121,6 @@ async function resolveRefreshToken() {
 }
 
 async function getAccessToken() {
-  // Reuse a cached access token if it has >60s of life left.
   if (_cachedToken && _cachedToken.expiresAt - Date.now() > 60_000) {
     return _cachedToken.accessToken;
   }
@@ -148,9 +168,6 @@ async function getAccessToken() {
   try { data = JSON.parse(text); } catch (_) { data = { raw: text }; }
 
   if (!resp.ok || !data.access_token) {
-    // Helpful, specific message. A 400 "invalid_grant" on a freshly-minted
-    // token almost always means the token was minted under a DIFFERENT app
-    // than QBO_CLIENT_ID/SECRET, or in Sandbox instead of Production.
     const detail = data.error_description || data.error || data.raw || '';
     let hint = '';
     if (resp.status === 400) {
@@ -163,18 +180,13 @@ async function getAccessToken() {
       (detail || 'Refresh token invalid or expired.') + hint
     );
     err.code = 'AUTH';
-    // 400 from Intuit = bad credential → surface as 401 to the caller.
     err.status = resp.status === 400 ? 401 : resp.status;
     throw err;
   }
 
   // Persist the rotated refresh token so the NEXT call uses the fresh one.
-  // This is the whole point of v2 — without it the chain goes stale.
   const rotated = data.refresh_token || null;
-  if (rotated && rotated !== refreshToken) {
-    await kvSet(KV_KEY, rotated);
-  } else if (rotated && tokenSource === 'env' && KV_ENABLED) {
-    // First run from env seed: write it into KV so KV becomes authoritative.
+  if (rotated && (rotated !== refreshToken || (tokenSource === 'env' && KV_ENABLED))) {
     await kvSet(KV_KEY, rotated);
   }
 
@@ -195,6 +207,8 @@ function lastRotatedRefreshToken() {
 function tokenDiagnostics() {
   return {
     kvEnabled: KV_ENABLED,
+    kvUrlVar: _KV.urlVar,       // which env var name supplied the KV URL (no value)
+    kvTokenVar: _KV.tokenVar,   // which env var name supplied the KV token (no value)
     kvKey: KV_KEY,
     hasEnvSeed: !!process.env.QBO_REFRESH_TOKEN,
     hasClientId: !!process.env.QBO_CLIENT_ID,
