@@ -3,6 +3,7 @@
   "routes": [
     { "src": "/api/w2-ytd", "dest": "/api/w2-ytd.js" },
     { "src": "/api/pnl-ytd", "dest": "/api/pnl-ytd.js" },
+    { "src": "/api/cash-position", "dest": "/api/cash-position.js" },
     { "src": "/api/health", "dest": "/api/health.js" },
     { "src": "/(.*)", "dest": "/public/index.html" }
   ]
