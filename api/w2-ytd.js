@@ -19,11 +19,13 @@
 //    exactly "Wages", and sum that row's per-employee column amounts.
 //
 //  Auth: header ACCESS_TOKEN:<secret>  OR  ?key=<secret>  vs VB_ACCESS_TOKEN
+//  (now via shared _gate.js — fail-closed + timing-safe, June 2026 hardening)
 //  Diagnostics (valid key/header): ?debug=1 (raw P&L), ?path=NAME, ?probe=1
 //  CORS: locked to vistabalancer.app (+ localhost).
 // ─────────────────────────────────────────────────────────────────────────────
 
 const { getAccessToken } = require('./_qbo-token.js');
+const { enforceGate } = require('./_gate.js');
 
 const QBO_BASE = 'https://quickbooks.api.intuit.com';
 
@@ -125,13 +127,9 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
-  const expected = process.env.VB_ACCESS_TOKEN;
   const debug = req.query && (req.query.debug === '1' || req.query.debug === 'true');
-  const onePath = req.query && req.query.path;
-  if (expected) {
-    const got = req.headers['access_token'] || req.headers['x-access-token'] || (req.query && req.query.key);
-    if (got !== expected) return res.status(401).json({ error: 'Unauthorized' });
-  }
+
+  if (!enforceGate(req, res)) return;
 
   const realmId = process.env.QBO_REALM_ID || '9341454566029927';
 

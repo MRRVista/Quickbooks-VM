@@ -2,7 +2,9 @@
 //  /api/pnl-ytd — LIVE YTD Profit & Loss, from QuickBooks.
 //
 //  Mirrors api/w2-ytd.js conventions exactly: shared _qbo-token.js for OAuth,
-//  same CORS allowlist, same ACCESS_TOKEN / ?key= auth, same realm default.
+//  same CORS allowlist, same ACCESS_TOKEN / ?key= gate (now via shared
+//  _gate.js — fail-closed + timing-safe, June 2026 hardening), same realm
+//  default.
 //
 //  Pulls the standard ProfitAndLoss report summarized BY MONTH, then reads the
 //  authoritative section Summary rows (QBO's own computed totals) for Income,
@@ -23,15 +25,15 @@
 //
 //  Auth: header ACCESS_TOKEN:<secret>  OR  ?key=<secret>  vs VB_ACCESS_TOKEN
 //  Diagnostics:
-//    ?diag=1   NO-SECRET health check. Runs BEFORE the gate. Reports whether
-//              your key matched the gate, KV status, and a client-id fingerprint
-//              (first4…last4 only). Use this to tell a gate-401 from an
-//              Intuit-401 without exposing anything.
+//    ?diag=1   Health check. Gate booleans answer pre-auth so you can tell a
+//              gate-401 from an Intuit-401; token internals (KV status,
+//              client-id fingerprint, realm) only return with a valid key.
 //    ?debug=1  (requires valid key/header) returns the raw QBO P&L body.
 //  CORS: locked to vistabalancer.app (+ localhost).
 // ─────────────────────────────────────────────────────────────────────────────
 
 const { getAccessToken, tokenDiagnostics } = require('./_qbo-token.js');
+const { enforceGate, gateInfo } = require('./_gate.js');
 
 const QBO_BASE = 'https://quickbooks.api.intuit.com';
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -203,36 +205,27 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
-  const expected = process.env.VB_ACCESS_TOKEN;
-  const got = req.headers['access_token'] || req.headers['x-access-token'] || (req.query && req.query.key);
   const debug = req.query && (req.query.debug === '1' || req.query.debug === 'true');
   const diag  = req.query && (req.query.diag === '1'  || req.query.diag === 'true');
 
-  // ── ?diag=1 — NO-SECRET health check. Runs BEFORE the gate so it always
-  //    answers, telling you exactly which wall you're hitting. Returns no
-  //    secret values — only booleans, lengths, and a fingerprint. ──────────
+  // ── ?diag=1 — health check. Gate booleans answer pre-auth so you can tell
+  //    a gate-401 from an Intuit-401; token internals only with a valid key
+  //    (June 2026 hardening: expectedLength removed, internals gated). ──────
   if (diag) {
-    let tdiag = {};
-    try { tdiag = typeof tokenDiagnostics === 'function' ? tokenDiagnostics() : {}; } catch (_) {}
+    const gate = gateInfo(req);
+    let tdiag = null;
+    if (gate.keyMatches) { try { tdiag = typeof tokenDiagnostics === 'function' ? tokenDiagnostics() : {}; } catch (_) { tdiag = {}; } }
     return res.status(200).json({
       diag: true,
-      gate: {
-        vbAccessTokenConfigured: !!expected,
-        keyProvided: !!got,
-        keyMatches: !!expected && got === expected,   // true ONLY when your key is correct
-        keyLengthSeen: got ? String(got).length : 0,
-        expectedLength: expected ? String(expected).length : 0,
-      },
-      token: tdiag,    // kvEnabled, kvKey, hasEnvSeed, hasClientId, hasClientSecret, clientIdFingerprint, realmId
-      note: 'keyMatches=false → your ?key= does not equal VB_ACCESS_TOKEN. ' +
-            'kvEnabled=false → connect a Vercel KV/Upstash store for self-healing. ' +
+      gate,
+      token: gate.keyMatches ? tdiag : 'redacted — pass the gate key to see token diagnostics',
+      note: 'keyMatches=false → your key does not equal VB_ACCESS_TOKEN. ' +
+            'With a valid key, token reports kvEnabled/kvKey/hasEnvSeed/clientIdFingerprint/realmId. ' +
             'clientIdFingerprint must match the app you minted the refresh token from.',
     });
   }
 
-  if (expected) {
-    if (got !== expected) return res.status(401).json({ error: 'Unauthorized', gate: true });
-  }
+  if (!enforceGate(req, res)) return;
 
   const realmId = process.env.QBO_REALM_ID || '9341454566029927';
 

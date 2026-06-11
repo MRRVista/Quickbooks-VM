@@ -7,9 +7,10 @@
 //  number with a "Use this" affordance.
 //
 //  Mirrors api/pnl-ytd.js conventions exactly: shared _qbo-token.js for OAuth,
-//  same CORS allowlist, same ACCESS_TOKEN / ?key= auth, same realm default,
-//  same ?diag=1 (no-secret health check, runs BEFORE the gate) and ?debug=1
-//  (requires valid key, returns the raw QBO query body).
+//  same CORS allowlist, same ACCESS_TOKEN / ?key= gate (now via shared
+//  _gate.js — fail-closed + timing-safe, June 2026 hardening), same realm
+//  default, same ?diag=1 (gate booleans pre-auth; token internals only with a
+//  valid key) and ?debug=1 (requires valid key, returns the raw QBO query body).
 //
 //  Account selection:
 //    - Default account name: "Vistamark Investments Checking" (override via
@@ -29,6 +30,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 const { getAccessToken, tokenDiagnostics } = require('./_qbo-token.js');
+const { enforceGate, gateInfo } = require('./_gate.js');
 
 const QBO_BASE = 'https://quickbooks.api.intuit.com';
 
@@ -108,38 +110,30 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
-  const expected = process.env.VB_ACCESS_TOKEN;
-  const got = req.headers['access_token'] || req.headers['x-access-token'] || (req.query && req.query.key);
   const debug = req.query && (req.query.debug === '1' || req.query.debug === 'true');
   const diag  = req.query && (req.query.diag === '1'  || req.query.diag === 'true');
 
   const wantName = process.env.QBO_CASH_ACCOUNT_NAME || 'Vistamark Investments Checking';
 
-  // ── ?diag=1 — NO-SECRET health check, runs BEFORE the gate. ──────────────
+  // ── ?diag=1 — health check. Gate booleans pre-auth; token internals only
+  //    when the caller passes the gate (June 2026 hardening). ───────────────
   if (diag) {
-    let tdiag = {};
-    try { tdiag = typeof tokenDiagnostics === 'function' ? tokenDiagnostics() : {}; } catch (_) {}
+    const gate = gateInfo(req);
+    let tdiag = null;
+    if (gate.keyMatches) { try { tdiag = typeof tokenDiagnostics === 'function' ? tokenDiagnostics() : {}; } catch (_) { tdiag = {}; } }
     return res.status(200).json({
       diag: true,
       endpoint: 'cash-position',
-      gate: {
-        vbAccessTokenConfigured: !!expected,
-        keyProvided: !!got,
-        keyMatches: !!expected && got === expected,
-        keyLengthSeen: got ? String(got).length : 0,
-        expectedLength: expected ? String(expected).length : 0,
-      },
-      token: tdiag,
+      gate,
+      token: gate.keyMatches ? tdiag : 'redacted — pass the gate key to see token diagnostics',
       cashAccountName: wantName,
-      note: 'keyMatches=false → your ?key= does not equal VB_ACCESS_TOKEN. ' +
+      note: 'keyMatches=false → your key does not equal VB_ACCESS_TOKEN. ' +
             'cashAccountName is the QBO Account.Name substring we match (Bank type). ' +
             'Override with env QBO_CASH_ACCOUNT_NAME.',
     });
   }
 
-  if (expected) {
-    if (got !== expected) return res.status(401).json({ error: 'Unauthorized', gate: true });
-  }
+  if (!enforceGate(req, res)) return;
 
   const realmId = process.env.QBO_REALM_ID || '9341454566029927';
 
