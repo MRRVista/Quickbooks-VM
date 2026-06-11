@@ -1,31 +1,30 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  /api/coa-setup — one-shot chart-of-accounts setup for the partner expense
-//  breakout + software vendor sub-accounts. DRY-RUN BY DEFAULT.
+//  /api/coa-setup — chart-of-accounts setup. DRY-RUN BY DEFAULT.
 //
-//  WHAT IT CREATES (only what doesn't already exist — idempotent by
-//  FullyQualifiedName, case-insensitive):
-//    Parents (Expense):
-//      • Software & Technology        (override name: ?softwareParent=Software)
-//      • Client Expenses / Prospect Expenses / COI Expenses
-//    Children:
-//      • one sub-account per software vendor under the software parent
-//        (default list below; override: ?vendors=A,B,C)
-//      • "<Category> - <INI>" under each partner category for each initial
-//        (default MR,SM,RW,WS; override: ?initials=MR,SM,RW,WS,DB)
+//  v2: matches the firm's EXISTING account naming (per the live P&L) instead
+//  of inventing a parallel initials-based tree:
+//    • Client/Prospect Entertainment → "Ent - <Advisor>"
+//    • Client/Prospect Meals         → "Meals - <Advisor>"
+//    • Client/Prospect Travel        → "Travel - <Advisor>"
+//    • COI Meals                     → "COI Meals - <Advisor>"   (?coiParents= to extend,
+//        e.g. &coiParents=COI Meals,COI Travel,COI Entertainment)
+//    • Software & Technology         → one sub per vendor (?vendors= to override)
+//  Advisors default: Matthew Rice, Sean McEvilly, Ryan Walter, William Seyfarth
+//  (?advisors=A,B,C to override — e.g. add Dave Beazley).
 //
-//  SAFETY:
-//    • GET only, behind the shared fail-closed gate (_gate.js).
-//    • Default is DRY-RUN: returns the full plan, writes NOTHING.
-//      Add &apply=1 to actually create the accounts.
-//    • Never edits or deletes existing accounts. Created accounts can be
-//      made inactive in the QBO UI if you change your mind.
-//    • Creating accounts does NOT reclassify historical transactions —
-//      recategorize those in QBO (Batch reclassify / Accountant tools).
+//  Idempotent by FullyQualifiedName (case-insensitive): existing accounts are
+//  skipped, never edited, never deleted. Per the current P&L, the gaps this
+//  will fill are: Ent - Matthew Rice, Ent - Ryan Walter, Travel - Ryan Walter,
+//  the four COI Meals subs, and the software tree.
 //
-//  SUBTYPES (change in QBO UI anytime; deliberately conservative here —
-//  confirm meals/entertainment tax treatment with your accountant):
-//    software children  → DuesSubscriptions
-//    partner categories → OtherBusinessExpenses
+//  SAFETY: GET only, behind the shared fail-closed gate (_gate.js). Default is
+//  DRY-RUN (full plan, zero writes); add &apply=1 to create. Creating accounts
+//  does NOT reclassify history — batch-reclassify in QBO to move old expenses.
+//
+//  SUBTYPES on new accounts (existing accounts untouched; confirm deductibility
+//  treatment with your accountant — one-click change in the QBO UI):
+//    Ent → Entertainment · Meals/COI Meals → TravelMeals · Travel → Travel ·
+//    software → DuesSubscriptions · other parents → OtherBusinessExpenses
 // ─────────────────────────────────────────────────────────────────────────────
 
 const { getAccessToken } = require('./_qbo-token.js');
@@ -39,10 +38,19 @@ const DEFAULT_VENDORS = [
   'Intuit QuickBooks', 'Vercel', 'Microsoft Azure', 'Cloudflare', 'GitHub',
   'Fireflies.ai', 'Zoom', 'Adobe',
 ];
-const PARTNER_CATEGORIES = ['Client Expenses', 'Prospect Expenses', 'COI Expenses'];
-const DEFAULT_INITIALS = ['MR', 'SM', 'RW', 'WS'];
+const DEFAULT_ADVISORS = ['Matthew Rice', 'Sean McEvilly', 'Ryan Walter', 'William Seyfarth'];
+
+// Client/Prospect categories — sub naming mirrors the existing books:
+// "<prefix> - <Advisor Full Name>" under each parent.
+const CLIENT_PROSPECT = [
+  { parent: 'Client/Prospect Entertainment', prefix: 'Ent',    subType: 'Entertainment' },
+  { parent: 'Client/Prospect Meals',         prefix: 'Meals',  subType: 'TravelMeals' },
+  { parent: 'Client/Prospect Travel',        prefix: 'Travel', subType: 'Travel' },
+];
+const DEFAULT_COI_PARENTS = ['COI Meals'];   // subs: "<parent> - <Advisor>"
+
 const SOFTWARE_SUBTYPE = 'DuesSubscriptions';
-const CATEGORY_SUBTYPE = 'OtherBusinessExpenses';
+const GENERIC_SUBTYPE  = 'OtherBusinessExpenses';
 
 const ALLOWED_ORIGINS = new Set([
   'https://vistabalancer.app',
@@ -79,8 +87,8 @@ async function qboPost(url, accessToken, payload) {
   return { status: r.status, ok: r.ok, body };
 }
 
-// Parse a comma-separated override param with sane caps; ':' stripped because
-// QBO reserves it for account hierarchy.
+// Comma-separated override param with sane caps; ':' stripped (QBO reserves it
+// for hierarchy paths).
 function parseListParam(raw, fallback, maxItems) {
   if (!raw) return fallback.slice();
   const items = String(raw).split(',')
@@ -100,8 +108,9 @@ module.exports = async function handler(req, res) {
   const apply = q.apply === '1' || q.apply === 'true';
 
   const softwareParent = (q.softwareParent ? String(q.softwareParent).replace(/:/g, '').slice(0, 80) : DEFAULT_SOFTWARE_PARENT) || DEFAULT_SOFTWARE_PARENT;
-  const vendors  = parseListParam(q.vendors,  DEFAULT_VENDORS, 30);
-  const initials = parseListParam(q.initials, DEFAULT_INITIALS, 10).map(s => s.toUpperCase());
+  const vendors    = parseListParam(q.vendors,    DEFAULT_VENDORS, 30);
+  const advisors   = parseListParam(q.advisors,   DEFAULT_ADVISORS, 10);
+  const coiParents = parseListParam(q.coiParents, DEFAULT_COI_PARENTS, 5);
 
   try {
     const accessToken = await getAccessToken();
@@ -116,21 +125,27 @@ module.exports = async function handler(req, res) {
     const byFqn = new Map();
     for (const a of rows) byFqn.set(String(a.FullyQualifiedName || a.Name || '').toLowerCase(), a);
 
-    // 2) Build the desired tree.
-    const desiredParents = [softwareParent, ...PARTNER_CATEGORIES];
-    const desiredChildren = [];   // { parent, name, subType }
+    // 2) Desired tree — mirrors the books' existing naming.
+    //    parents: [{ name, subType }], children: [{ parent, name, subType }]
+    const desiredParents = [{ name: softwareParent, subType: GENERIC_SUBTYPE }];
+    const desiredChildren = [];
     for (const v of vendors) desiredChildren.push({ parent: softwareParent, name: v, subType: SOFTWARE_SUBTYPE });
-    for (const cat of PARTNER_CATEGORIES) {
-      for (const ini of initials) desiredChildren.push({ parent: cat, name: cat + ' - ' + ini, subType: CATEGORY_SUBTYPE });
+    for (const cat of CLIENT_PROSPECT) {
+      desiredParents.push({ name: cat.parent, subType: cat.subType });
+      for (const adv of advisors) desiredChildren.push({ parent: cat.parent, name: cat.prefix + ' - ' + adv, subType: cat.subType });
+    }
+    for (const cp of coiParents) {
+      desiredParents.push({ name: cp, subType: /meal/i.test(cp) ? 'TravelMeals' : /travel/i.test(cp) ? 'Travel' : /ent/i.test(cp) ? 'Entertainment' : GENERIC_SUBTYPE });
+      for (const adv of advisors) desiredChildren.push({ parent: cp, name: cp + ' - ' + adv, subType: /meal/i.test(cp) ? 'TravelMeals' : /travel/i.test(cp) ? 'Travel' : /ent/i.test(cp) ? 'Entertainment' : GENERIC_SUBTYPE });
     }
 
     const plan = { parentsExisting: [], parentsToCreate: [], childrenExisting: [], childrenToCreate: [] };
-    const parentIds = new Map();   // parent name -> Id (existing or created)
+    const parentIds = new Map();
 
     for (const p of desiredParents) {
-      const hit = byFqn.get(p.toLowerCase());
-      if (hit) { plan.parentsExisting.push({ name: p, id: hit.Id, active: hit.Active }); parentIds.set(p, hit.Id); }
-      else plan.parentsToCreate.push({ name: p });
+      const hit = byFqn.get(p.name.toLowerCase());
+      if (hit) { plan.parentsExisting.push({ name: p.name, id: hit.Id, active: hit.Active }); parentIds.set(p.name, hit.Id); }
+      else plan.parentsToCreate.push(p);
     }
     for (const c of desiredChildren) {
       const fqn = (c.parent + ':' + c.name).toLowerCase();
@@ -143,20 +158,20 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({
         dryRun: true,
         realmId,
-        softwareParent, vendors, initials,
+        softwareParent, vendors, advisors, coiParents,
         ...plan,
-        note: 'Nothing was written. Re-run with &apply=1 to create the accounts listed in parentsToCreate/childrenToCreate. ' +
-              'Creating accounts does not reclassify historical transactions.',
+        note: 'Nothing was written. Re-run with &apply=1 to create the accounts in parentsToCreate/childrenToCreate. ' +
+              'Existing accounts are never modified. Creating accounts does not reclassify historical transactions.',
       });
     }
 
-    // 3) APPLY — parents first, then children (need ParentRef ids).
+    // 3) APPLY — parents first, then children (ParentRef ids).
     const created = { parents: [], children: [] };
     const errors = [];
     const createUrl = `${QBO_BASE}/v3/company/${realmId}/account?minorversion=70`;
 
     for (const p of plan.parentsToCreate) {
-      const r = await qboPost(createUrl, accessToken, { Name: p.name, AccountType: 'Expense', AccountSubType: CATEGORY_SUBTYPE });
+      const r = await qboPost(createUrl, accessToken, { Name: p.name, AccountType: 'Expense', AccountSubType: p.subType });
       const acct = r.ok && r.body && r.body.Account;
       if (acct) { created.parents.push({ name: p.name, id: acct.Id }); parentIds.set(p.name, acct.Id); }
       else errors.push({ name: p.name, status: r.status, detail: r.body && (r.body.Fault || r.body) });
@@ -179,8 +194,8 @@ module.exports = async function handler(req, res) {
       created,
       skippedExisting: { parents: plan.parentsExisting, children: plan.childrenExisting },
       errors,
-      note: 'Created accounts appear immediately in QBO chart of accounts and on the P&L once expenses are coded to them. ' +
-            'Recategorize historical transactions in QBO to populate history.',
+      note: 'New accounts appear immediately in the QBO chart of accounts and on the P&L once expenses are coded to them. ' +
+            'Batch-reclassify historical transactions in QBO to populate history.',
     });
 
   } catch (err) {
