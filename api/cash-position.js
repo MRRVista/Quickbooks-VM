@@ -1,33 +1,35 @@
-// ─────────────────────────────────────────────────────────────────────────────
-//  /api/cash-position — LIVE bank cash balance, from QuickBooks.
+// -----------------------------------------------------------------------------
+//  /api/cash-position - LIVE bank cash balance, from QuickBooks.
 //
-//  Returns the CurrentBalance of the firm's operating checking account so the
-//  app can SEED (not lock) the Initial Cash field on the P&L Cash Projection.
-//  The practitioner still edits the field by hand; this just shows the live
-//  number with a "Use this" affordance.
+//  v2 (Jul 8 2026): COMPOSITE MODE. The physical operating account (...9619)
+//  exists as TWO ledgers in QBO - "Vistamark Investments Checking (9619)"
+//  (Id 11, CashOnHand) and "Vistamark IL (9619)" (Id 281, Checking) - with
+//  activity split across them. A single-ledger CurrentBalance therefore
+//  overstates cash by the other ledger's balance (triangulated Jul 8 2026:
+//  Id 11 alone = 225,126.73; both summed = 134,255.86; actual Chase balance
+//  = 131,729.70 -> the sum lands within ~2.5K = genuinely uncleared items,
+//  which the app-side Bank Adjustment field exists to absorb).
 //
-//  Mirrors api/pnl-ytd.js conventions exactly: shared _qbo-token.js for OAuth,
-//  same CORS allowlist, same ACCESS_TOKEN / ?key= gate (now via shared
-//  _gate.js — fail-closed + timing-safe, June 2026 hardening), same realm
-//  default, same ?diag=1 (gate booleans pre-auth; token internals only with a
-//  valid key) and ?debug=1 (requires valid key, returns the raw QBO query body).
+//  Behavior: match ALL active Bank-type accounts whose Name contains the
+//  configured string (default now '9619' - the account-number mask present
+//  in both ledger names), SUM their CurrentBalance, and return the composite.
+//  After the ledgers are merged in QBO the sum degenerates to the single
+//  register - no further code change needed.
 //
-//  Account selection:
-//    - Default account name: "Vistamark Investments Checking" (override via
-//      env QBO_CASH_ACCOUNT_NAME). We match QBO Account.Name that CONTAINS the
-//      configured string (case-insensitive), AccountType = 'Bank', Active=true,
-//      and pick the one with the largest CurrentBalance if several match.
-//    - Why name-contains rather than exact: QBO surfaces the account as
-//      "Vistamark Investments Checking (9619)" in the UI but stores Name without
-//      the trailing "(9619)" mask in most orgs — contains is the safe match.
+//  Response shape (superset of v1; the app reads currentBalance + account.name):
+//      { source, pulledAt,
+//        account:{ id, name, accountType, accountSubType },   // primary ledger
+//        currentBalance,                                       // SUM of matches
+//        componentCount, components:[{ id, name, accountSubType, balance }],
+//        currency }
 //
-//  Shape consumed by the app:
-//      { source, pulledAt, account:{ id, name, accountType, accountSubType },
-//        currentBalance, currency }
+//  Mirrors api/pnl-ytd.js conventions: shared _qbo-token.js for OAuth, same
+//  CORS allowlist, same ACCESS_TOKEN / ?key= gate via _gate.js (fail-closed +
+//  timing-safe), same realm default, same ?diag=1 and ?debug=1 semantics.
 //
 //  Auth: header ACCESS_TOKEN:<secret>  OR  ?key=<secret>  vs VB_ACCESS_TOKEN
 //  CORS: locked to vistabalancer.app (+ localhost).
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 const { getAccessToken, tokenDiagnostics } = require('./_qbo-token.js');
 const { enforceGate, gateInfo } = require('./_gate.js');
@@ -63,44 +65,56 @@ async function getJson(url, accessToken) {
 
 function r2(v) { return Math.round((+v || 0) * 100) / 100; }
 
-// Build the QBO Account query. We pull all Bank accounts (small list) and do
-// the name-contains match in JS so we don't have to escape quoting in QBQL and
-// so a slightly different stored name still resolves.
+// Pull all Bank accounts (small list); name-contains match happens in JS so we
+// avoid QBQL quote-escaping and tolerate naming drift.
 function bankAccountsQueryUrl(realmId) {
   const q = encodeURIComponent("select Id, Name, AccountType, AccountSubType, CurrentBalance, Active from Account where AccountType = 'Bank'");
   return `${QBO_BASE}/v3/company/${realmId}/query?query=${q}&minorversion=70`;
 }
 
-function pickAccount(queryBody, wantName) {
+// v2: return EVERY active bank ledger whose name contains the configured
+// string, sorted by balance desc (largest = primary for display/back-compat).
+function pickAccounts(queryBody, wantName) {
   const rows = (queryBody && queryBody.QueryResponse && queryBody.QueryResponse.Account) || [];
   const want = String(wantName || '').toLowerCase().trim();
-  // active bank accounts whose name contains the configured string
   const matches = rows.filter(a =>
     (a.Active === undefined || a.Active === true) &&
     String(a.Name || '').toLowerCase().includes(want)
   );
-  if (!matches.length) return null;
-  // if several, take the largest current balance (the operating account)
   matches.sort((a, b) => (+b.CurrentBalance || 0) - (+a.CurrentBalance || 0));
-  return matches[0];
+  return matches;
 }
 
 async function computeCash(accessToken, realmId, wantName) {
   const url = bankAccountsQueryUrl(realmId);
   const r = await getJson(url, accessToken);
   if (!r.ok) { const e = new Error('Account query failed (' + r.status + ')'); e.detail = r.body; e.httpStatus = r.status; throw e; }
-  const acct = pickAccount(r.body, wantName);
-  if (!acct) { const e = new Error('No matching bank account for "' + wantName + '"'); e.httpStatus = 404; throw e; }
+  const matches = pickAccounts(r.body, wantName);
+  if (!matches.length) { const e = new Error('No matching bank account for "' + wantName + '"'); e.httpStatus = 404; throw e; }
+
+  const sum = r2(matches.reduce((s, a) => s + (+a.CurrentBalance || 0), 0));
+  const primary = matches[0];
+  const multi = matches.length > 1;
+
   return {
-    source: 'QuickBooks Account.CurrentBalance (live)',
+    source: multi
+      ? 'QuickBooks Account.CurrentBalance (live, composite of ' + matches.length + ' ledgers)'
+      : 'QuickBooks Account.CurrentBalance (live)',
     pulledAt: new Date().toISOString(),
     account: {
-      id: acct.Id,
-      name: acct.Name,
-      accountType: acct.AccountType,
-      accountSubType: acct.AccountSubType || null,
+      id: primary.Id,
+      name: multi ? (primary.Name + ' + ' + (matches.length - 1) + ' linked ledger(s), net') : primary.Name,
+      accountType: primary.AccountType,
+      accountSubType: primary.AccountSubType || null,
     },
-    currentBalance: r2(acct.CurrentBalance),
+    currentBalance: sum,
+    componentCount: matches.length,
+    components: matches.map(a => ({
+      id: a.Id,
+      name: a.Name,
+      accountSubType: a.AccountSubType || null,
+      balance: r2(a.CurrentBalance),
+    })),
     currency: 'USD',
   };
 }
@@ -113,10 +127,10 @@ module.exports = async function handler(req, res) {
   const debug = req.query && (req.query.debug === '1' || req.query.debug === 'true');
   const diag  = req.query && (req.query.diag === '1'  || req.query.diag === 'true');
 
-  const wantName = process.env.QBO_CASH_ACCOUNT_NAME || 'Vistamark Investments Checking';
+  // v2 default: match on the account-number mask so BOTH split 9619 ledgers
+  // resolve. Override with env QBO_CASH_ACCOUNT_NAME.
+  const wantName = process.env.QBO_CASH_ACCOUNT_NAME || '9619';
 
-  // ── ?diag=1 — health check. Gate booleans pre-auth; token internals only
-  //    when the caller passes the gate (June 2026 hardening). ───────────────
   if (diag) {
     const gate = gateInfo(req);
     let tdiag = null;
@@ -125,11 +139,11 @@ module.exports = async function handler(req, res) {
       diag: true,
       endpoint: 'cash-position',
       gate,
-      token: gate.keyMatches ? tdiag : 'redacted — pass the gate key to see token diagnostics',
+      token: gate.keyMatches ? tdiag : 'redacted - pass the gate key to see token diagnostics',
       cashAccountName: wantName,
-      note: 'keyMatches=false → your key does not equal VB_ACCESS_TOKEN. ' +
-            'cashAccountName is the QBO Account.Name substring we match (Bank type). ' +
-            'Override with env QBO_CASH_ACCOUNT_NAME.',
+      mode: 'composite-sum (v2): all active Bank ledgers whose Name contains the match string are summed',
+      note: 'keyMatches=false -> your key does not equal VB_ACCESS_TOKEN. ' +
+            'Override the match string with env QBO_CASH_ACCOUNT_NAME.',
     });
   }
 
