@@ -11,13 +11,19 @@
 //  rows as JSON or as CSV shaped for vistarandall's qbo_import
 //  (Date,Description,Amount,Category — parseQboCsv's recognized headers).
 //
-//  Sign: GL amounts are debit(+)/credit(−). For a checking account that is
-//  deposit(+)/payment(−); for the credit card charge(−)/payment(+). Both
-//  flip to the Plaid convention (positive = money out) under qbo_import's
-//  sign:"bank", which is why this endpoint does NOT re-sign anything.
+//  Sign (validated 2026-08-08 against the Plaid overlap window): QBO's GL
+//  presents the checking accounts in bank convention — deposit(+)/payment(−),
+//  so qbo_import sign:"bank" flips them to the Plaid convention. The credit
+//  card comes through in statement convention — charge(+)/payment(−) — which
+//  IS the Plaid convention already, so the card imports with sign:"plaid".
+//  This endpoint never re-signs anything; the caller picks per account.
+//
+//  v1.1: cell() strips CR/LF/tab from every field so a multiline QBO memo
+//  can never break the one-row-per-line CSV contract (space runs are left
+//  alone to keep qbo: dedupe hashes stable for rows already imported).
 //
 //  GET params:
-//    account=&lt;substring&gt;   required unless list=1 — case-insensitive match
+//    account=<substring>   required unless list=1 — case-insensitive match
 //                          against GL account section names.
 //    from=YYYY-MM-DD       required.
 //    to=YYYY-MM-DD         required.
@@ -26,7 +32,7 @@
 //    debug=1               raw QBO GL body (valid key required).
 //    diag=1                gate/token health, same contract as pnl-ytd.
 //
-//  Auth: header ACCESS_TOKEN:&lt;secret&gt;  OR  ?key=&lt;secret&gt;  vs VB_ACCESS_TOKEN
+//  Auth: header ACCESS_TOKEN:<secret>  OR  ?key=<secret>  vs VB_ACCESS_TOKEN
 //  CORS: same allowlist as pnl-ytd.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -73,10 +79,13 @@ function colIndexMap(report) {
   return map;
 }
 
+// Newlines and tabs inside a field would break the one-row-per-line CSV
+// contract downstream; space runs are deliberately preserved so identical
+// rows keep producing identical qbo: dedupe hashes across re-imports.
 function cell(colData, idx) {
   if (idx == null || !colData || !colData[idx]) return '';
   const v = colData[idx].value;
-  return v == null ? '' : String(v).trim();
+  return v == null ? '' : String(v).replace(/[\r\n\t]+/g, ' ').trim();
 }
 
 // Collect every descendant Data row of a matched account section.
