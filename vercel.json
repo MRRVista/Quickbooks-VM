@@ -7,6 +7,7 @@
     { "src": "/api/equity-balance", "dest": "/api/equity-balance.js" },
     { "src": "/api/credit-cards", "dest": "/api/credit-cards.js" },
     { "src": "/api/coa-setup", "dest": "/api/coa-setup.js" },
+    { "src": "/api/bank-register", "dest": "/api/bank-register.js" },
     { "src": "/api/health", "dest": "/api/health.js" },
     { "src": "/(.*)", "dest": "/public/index.html" }
   ]
